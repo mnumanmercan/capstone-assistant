@@ -1,0 +1,9 @@
+# Image'a KOPYALANMAYACAK dosyalar (.gitignore mantığı)
+
+.env                # ← SECRET! asla image'a girmez, runtime'da verilir
+.venv/              # sanal ortam; image içinde uv sync ile yeniden kurulur
+__pycache__/        # Python cache; gereksiz
+*.pyc
+.git/               # git geçmişi; image'da işi yok, boyut şişirir
+.pytest_cache/
+*.md                # notlar/dokümanlar; çalışma için gerekmez
