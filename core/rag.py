@@ -57,7 +57,7 @@ if __name__ == "__main__":
     chunks = chunk_text(load_document(yol))
     doc_vecs = embed_chunks(chunks)
 
-    soru = "What is the capital of France?"
+    soru = "Why does proving your inner voice wrong help you?"
     ilgili_chunklar = retrieve(soru, chunks, doc_vecs, k=3)   # ← önce ara
     context = build_context(ilgili_chunklar)
     print(context)
