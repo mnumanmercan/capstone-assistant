@@ -1,6 +1,7 @@
-def main():
-    print("Hello from capstone-assistan!")
+from fastapi import FastAPI
 
+app = FastAPI()
 
-if __name__ == "__main__":
-    main()
+@app.get("/health")
+async def get_status():
+    return {"status": "ok"}
