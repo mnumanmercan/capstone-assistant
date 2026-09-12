@@ -1,70 +1,172 @@
-## Önemli Notlar
+# Capstone Assistant
 
-### 🧾 Batch vs Async — Cheatsheet
+Lokaldeki dokümanlardan cevap vermeye çalışan bir AI asistanı.
 
-**Tek cümlelik tanımlar**
+Cevaplar yalnızca retrieve edilen kaynak pasajlardan gelir. Her cevapta citation ve bir güvenilirlik skoru var. Cevap dokümanlarda yoksa asistanın bunu söylemesi gerekiyor.
 
-- **Batch** = *çok veriyi TEK istekte* gönder → **round-trip sayısını** azaltır.
-- **Async** = *çok isteği EŞZAMANLI* gönder → **bekleme sürelerini üst üste bindirir** (bloklamaz).
+LangChain'i ve vektör veritabanlarını bilerek atladım. Her katmanı kendim görmek istedim, o yüzden buradaki her şey provider SDK'ları üzerine yazılmış düz Python.
 
-İkisi rakip değil, **farklı eksende** iki kaldıraç. Biri "kaç istek", diğeri "istekler nasıl beklenir".
+> **Durum:** Faz 0–4 tamamlandı ve çalışıyor. API katmanı ve deployment henüz önümde. Bkz. [Yol haritası](#yol-haritası).
 
-**Zihinsel model 🍽️**
+---
 
-Restoranda 10 kişilik masasın:
+## Ne öğrenmeye çalıştım
 
-- **Naif (döngü):** Garson her kişinin siparişini ayrı ayrı mutfağa götürüp bekler, döner, sonrakini alır. 10 gidiş-dönüş.
-- **Batch:** Garson 10 siparişi tek kağıda yazıp **bir kez** mutfağa götürür. 1 gidiş-dönüş.
-- **Async:** 10 garson aynı anda 10 masaya bakar; biri beklerken diğerleri çalışır. Bekleme süreleri çakışır.
+RAG'i birleştirmek kolay, anlamak zor. Her aşamayı elle yazıp nerede kırıldığını görmek istedim.
 
-**Ne zaman hangisi?**
+Cevabını aradığım üç soru:
 
-| Durum | Çözüm |
+- **Modelin uydurmasını nasıl engellersin?** Onu tag'lenmiş kaynak bloklarıyla sınırlandırıp, cevap orada yoksa reddetmesini istiyorsun. Çoğunlukla işe yarıyor.
+- **Bir cevabın gerçek olup olmadığını nasıl kontrol edersin?** Pydantic model olarak döndürüyorsun; citation'lar tam chunk index'lerine geri eşleniyor.
+- **Hiçbir dokümanın cevaplayamadığı sorular ne olacak?** Tool-calling agent loop'u hesap ve canlı veri işlerini üstleniyor.
+
+---
+
+## Mimari
+
+```mermaid
+flowchart LR
+    A[Doküman] --> B[Chunking]
+    B --> C[Batch embedding<br/>Voyage AI]
+    C --> D[(Vektörler<br/>NumPy, in-memory)]
+
+    Q[Soru] --> E[Query embedding]
+    E --> F[Top-k cosine<br/>similarity]
+    D --> F
+    F --> G[Tag'lenmiş context]
+    G --> H[Claude<br/>structured output]
+    H --> I[answer · sources<br/>reliability]
+
+    Q --> J[Agent loop] --> K[tool'lar] --> J
+```
+
+---
+
+## Neler yapıyor
+
+| | |
 |---|---|
-| API tek çağrıda liste kabul ediyor (Voyage `embed`, OpenAI embeddings) | **Batch** |
-| Her çağrı bağımsız + API liste kabul etmiyor (LLM `messages.create`, 100 ayrı soru) | **Async** (`asyncio.gather`) |
-| Devasa hacim, batch limitini aşıyorsun (50.000 chunk, limit 1000) | **İkisi**: 50 batch → `gather` ile paralel |
-| CPU işi (numpy hesap, saf Python) | **Hiçbiri** — async I/O beklemesini gizler, hesabı hızlandırmaz |
+| **Ingestion** | Metni paragraf chunk'larına böler, boşları eler |
+| **Batch embedding** | Tüm chunk'lar N çağrı değil tek Voyage AI çağrısında |
+| **Vectorized retrieval** | Top-k cosine similarity tek matris çarpımı: `(N, 1024) @ (1024,)` |
+| **Grounded generation** | Kaynakla sınırlı prompt, açık reddetme davranışı |
+| **Structured output** | Pydantic model: `answer`, `sources`, `reliability` |
+| **Tool-calling agent** | Multi-turn loop, dispatcher registry, max-step guard |
+| **Fail-fast config** | Tipli ayarlar, import anında doğrulanıyor |
 
-**Kod kalıpları**
+---
 
-Batch (embedding — Faz 1):
+## Tech stack
 
-```python
-# 1 istek, 1000 metin
-vecs = vo.embed(chunks, model="voyage-4", input_type="document").embeddings
+**Core** — Python 3.12 · [uv](https://github.com/astral-sh/uv) · Pydantic · pydantic-settings
+
+**AI** — Anthropic SDK (`claude-haiku-4-5`) · Voyage AI (`voyage-4`, 1024 boyut)
+
+**Veri** — NumPy
+
+**Planlanan** — FastAPI · Uvicorn · Docker
+
+---
+
+## Yapı
+
+```
+capstone-assistant/
+├── config.py              # Tipli ayarlar
+├── main.py                # FastAPI app (henüz yazılmadı)
+├── core/
+│   ├── ingest.py          # load_document · chunk_text · embed_chunks
+│   ├── retrieve.py        # top-k retrieval
+│   ├── generate.py        # build_context · RagAnswer · generate
+│   └── agent.py           # tool'lar, dispatcher, agent loop
+├── data/                  # Kaynak dokümanlar
+├── pyproject.toml
+└── .env                   # API key'leri (commit edilmiyor)
 ```
 
-Async (bağımsız LLM çağrıları):
+---
 
-```python
-import asyncio
+## Kurulum
 
-async def sor(q):
-    return await client.messages.create(...)   # await = "bekle ama bloklamadan"
+Python 3.12 ve [uv](https://github.com/astral-sh/uv) gerekiyor.
 
-# 100 soru eşzamanlı — Promise.all([...]) karşılığı
-cevaplar = await asyncio.gather(*[sor(q) for q in sorular])
+```bash
+git clone https://github.com/<kullanici-adiniz>/capstone-assistant.git
+cd capstone-assistant
+
+uv python pin 3.12
+uv sync
 ```
 
-Batch + Async birlikte (limit aşımı):
+Proje kökünde `.env` oluşturun:
 
-```python
-batches = [chunks[i:i+1000] for i in range(0, len(chunks), 1000)]
-sonuclar = await asyncio.gather(*[embed_batch(b) for b in batches])
+```env
+ANTHROPIC_API_KEY=sk-ant-...
+VOYAGE_API_KEY=pa-...
 ```
 
-**JS köprüsü 🌉**
+Her aşamayı proje kökünden modül olarak çalıştırın:
 
-- **Batch** ≈ tek `fetch(url, {body: JSON.stringify(items)})` — array gönderirsin.
-- **Async** ≈ `await Promise.all(items.map(x => fetch(...)))` — N eşzamanlı istek.
-- `asyncio.gather` ≈ `Promise.all`. `await` ≈ `await`. Python'da fark: `async def` fonksiyonu ancak bir **event loop** içinde (`asyncio.run(...)`) çalışır; JS'te loop her zaman gizlice oradadır.
+```bash
+uv run python -m core.ingest      # chunk'la ve embed et
+uv run python -m core.retrieve    # top-k pasajı getir
+uv run python -m core.generate    # tam RAG pipeline
+uv run python -m core.agent       # tool'larla agent loop
+```
 
-**⚠️ Karıştırma tuzağı**
+---
 
-"Batch = paralel/async" **DEĞİL.** Batch tek, senkron bir HTTP isteği — paralellik yok, sadece az round-trip. Async ise paralellik/eşzamanlılık.
+## Nasıl çalışıyor
 
-**Neden ikisi de maliyet/performans meselesi 💰**
+**Chunking.** Dokümanlar boş satırlardan bölünüyor, yani paragraflar semantik birim oluyor. İşe yarayan en basit yöntem ve bedelini şimdiden görüyorum: test korpusundaki chunk'lar 29 ile 579 karakter arasında.
 
-- **Batch:** az round-trip = az gecikme + bazı API'lerde **batch indirimi** (%50'ye kadar).
-- **Async:** toplam süre = en yavaş istek (sıralıda = tüm sürelerin toplamı). 100 çağrı × 1sn: sıralı 100sn, async ~1-2sn.
+**Embedding.** Tüm chunk'lar tek bir batch request ile Voyage AI'a gidiyor. Dokümanlar `input_type="document"`, sorular `input_type="query"` kullanıyor — model asimetrik eğitilmiş, bunu dokümantasyonu okuyana kadar bilmiyordum.
+
+**Retrieval.** Voyage unit-length vektör döndürüyor, dolayısıyla cosine similarity aslında düz bir nokta çarpımı. Bu da tüm korpusu skorlamayı tek matris-vektör çarpımına, top-k'yı tek `argsort`'a indiriyor. Chunk başına loop yok. Bunu çözmek projenin en keyifli kısmıydı.
+
+**Context.** Getirilen chunk'lar index'li tag'lere sarılıyor:
+
+```xml
+<source id="0">...</source>
+<source id="1">...</source>
+```
+
+ID'ler sıfır tabanlı, liste index'leriyle birebir eşleşiyor. Burada bir kayma olsa bütün citation'lar sessizce bozulurdu.
+
+**Generation.** System prompt modeli tag içindeki içerikle sınırlıyor. Çıktı Pydantic modele parse ediliyor, böylece bozuk bir yanıt downstream'de değil sınırda patlıyor.
+
+**Agent loop.** Modeli tool şemalarıyla çağır. `stop_reason` `tool_use` değilse dön. Değilse istenen her tool'u isim→fonksiyon dispatcher'ı ile çalıştır, sonucu `tool_result` bloğu olarak geri besle. Max-step guard sonsuz döngüyü engelliyor.
+
+---
+
+## Hâlâ pürüzlü olanlar
+
+Failure mode'lar bana çalışan kısımlardan daha fazlasını öğretti, o yüzden onları yazılı tutuyorum.
+
+- **Grounding garanti değil.** Bir adversarial testte model, reddetmesi gereken context'i özetledi. Bunun ne sıklıkta olduğunu ölçecek bir yöntemim henüz yok — eval harness'ın yol haritasında olma sebebi bu.
+- **`calculate` `eval` kullanıyor.** Lokal bir tool için sorun değil ama üretime çıkaracağım bir şey değil. AST parser'a geçirmek to-do listemde.
+- **Tool kullanımı olasılıksal.** Model bazen tool'u atlayıp aritmetiği kendi yapıyor. Bunun bir prompting problemi olduğunu düşünüyorum ama kanıtlayamadım.
+- **Vektörler bellekte.** Bu ölçekte sorun değil, ayrıca similarity matematiğini öğrenirken görünür kalmasını sağladı. Gerçek vektör deposu sonraki adımlarda.
+- **Client'lar her modülde ayrı oluşuyor.** Tek bir paylaşımlı modülde birleştirmek gerekiyor.
+
+---
+
+## Yol haritası
+
+| Faz | Kapsam | Durum |
+|-----|--------|-------|
+| 0 | Proje iskeleti, tipli config | ✅ |
+| 1 | Veri katmanı — ingest, chunk, embed | ✅ |
+| 2 | Retrieval — semantic search | ✅ |
+| 3 | Generation — citation'lı grounded cevaplar | ✅ |
+| 4 | Agent ve tool'lar | ✅ |
+| 5 | API katmanı — FastAPI, streaming | 🔜 |
+| 6 | Sertleştirme — logging, retry, maliyet takibi | ⬜ |
+| 7 | Docker ve deployment | ⬜ |
+| 8 | Eval harness, memory, vektör deposu | ⬜ |
+
+---
+
+## Lisans
+
+MIT
