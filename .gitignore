@@ -10,3 +10,6 @@ wheels/
 # Virtual environments
 .venv
 .env
+
+# embed cache
+data/.index_cache.json

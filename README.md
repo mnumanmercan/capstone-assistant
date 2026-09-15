@@ -4,7 +4,7 @@ Lokaldeki dokümanlardan cevap vermeye çalışan bir AI asistanı.
 
 Cevaplar yalnızca retrieve edilen kaynak pasajlardan gelir. Her cevapta citation ve bir güvenilirlik skoru var. Cevap dokümanlarda yoksa asistanın bunu söylemesi gerekiyor.
 
-LangChain'i ve vektör veritabanlarını bilerek atladım. Her katmanı kendim görmek istedim, o yüzden buradaki her şey provider SDK'ları üzerine yazılmış düz Python.
+LangChain'i ve vektör veritabanları olmadan her katmanı temel konseptler kullanarak geliştirip öğrenmeye odaklanıldı, o yüzden buradaki her şey provider SDK'ları ile yazılmış Python projesi.
 
 > **Durum:** Faz 0–4 tamamlandı ve çalışıyor. API katmanı ve deployment henüz önümde. Bkz. [Yol haritası](#yol-haritası).
 
