@@ -90,7 +90,7 @@ if __name__ == "__main__":
     doc_vecs = embed_chunks(chunks)
 
     soru = "Why does proving your inner voice wrong help you?"
-    ilgili_chunklar = retrieve(soru, chunks, doc_vecs, k=3)
+    ilgili_chunklar, skorlar = retrieve(soru, chunks, doc_vecs, k=3)
     context = build_context(ilgili_chunklar)
 
     cevap = generate(soru, context)

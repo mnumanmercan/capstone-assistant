@@ -1,10 +1,11 @@
 import hashlib
 import json
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Literal
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
@@ -12,11 +13,19 @@ from starlette.concurrency import run_in_threadpool
 from core.ingest import load_document, chunk_text, embed_chunks
 from core.retrieve import retrieve
 from core.rag import build_context, generate, stream_generate, RagAnswer
+from core.agent import agent
 
 DATA_PATH = Path(__file__).parent / "data" / "life-changing-daily-habit.txt"
 CACHE_PATH = Path(__file__).parent / "data" / ".index_cache.json"
 
+# Cosine benzerlik eşikleri. Kendi verinde kalibre edilmeli (aşağıdaki nota bak).
+HIGH_THRESHOLD = 0.70
+NEUTRAL_THRESHOLD = 0.55
 
+
+# ----------------------------------------------------------------------------
+# Index
+# ----------------------------------------------------------------------------
 def build_index(path: Path) -> tuple[list[str], list[list[float]]]:
     """Dokümanı chunk'la ve embed et. İçerik değişmediyse diskteki cache'i kullan."""
     text = load_document(path)
@@ -54,70 +63,114 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Capstone Assistant", version="0.1.0", lifespan=lifespan)
 
 
+# ----------------------------------------------------------------------------
+# Modeller
+# ----------------------------------------------------------------------------
 class AskRequest(BaseModel):
     question: str = Field(min_length=3, max_length=1000)
     k: int = Field(default=3, ge=1, le=10)
 
 
-def sse(event: str, data) -> str:
-    """Bir Python değerini SSE mesaj formatına çevirir.
+class AgentRequest(BaseModel):
+    question: str = Field(min_length=3, max_length=1000)
 
-    Format: 'event: <tip>\\ndata: <json>\\n\\n'  (çift newline = mesaj sonu)
-    ensure_ascii=False -> Türkçe karakterler bozulmasın.
-    """
+
+class AgentResponse(BaseModel):
+    answer: str
+
+
+@dataclass
+class Retrieval:
+    """Bir sorunun retrieval sonucu: chunk'lar, skorlar ve hazır context."""
+
+    question: str
+    chunks: list[str]
+    scores: list[float]
+    context: str
+
+    @property
+    def top_score(self) -> float:
+        return self.scores[0] if self.scores else 0.0
+
+    @property
+    def reliability(self) -> Literal["high", "neutral", "low"]:
+        """Modele SORMADAN, retrieval skorundan hesaplanır: bedava + deterministik."""
+        if self.top_score >= HIGH_THRESHOLD:
+            return "high"
+        if self.top_score >= NEUTRAL_THRESHOLD:
+            return "neutral"
+        return "low"
+
+    def as_sources(self) -> list[dict]:
+        return [
+            {"id": i, "score": round(s, 4), "preview": c[:120]}
+            for i, (c, s) in enumerate(zip(self.chunks, self.scores))
+        ]
+
+
+# ----------------------------------------------------------------------------
+# Dependency: /ask ve /ask/stream'in ortak retrieval adımı
+# ----------------------------------------------------------------------------
+async def get_retrieval(payload: AskRequest, request: Request) -> Retrieval:
+    """React custom hook gibi: endpoint 'bana retrieval lazım' der, gerisi buranın işi."""
+    # retrieve blocking -> async fonksiyonun içinde threadpool'a atılmalı
+    ilgili_chunklar, scores = await run_in_threadpool(
+        retrieve,
+        payload.question,
+        request.app.state.chunks,
+        request.app.state.doc_vecs,
+        payload.k,
+    )
+    return Retrieval(
+        question=payload.question,
+        chunks=ilgili_chunklar,
+        scores=scores,
+        context=build_context(ilgili_chunklar),
+    )
+
+
+def sse(event: str, data) -> str:
+    """Python değerini SSE mesajına çevirir: 'event: <tip>\\ndata: <json>\\n\\n'."""
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+# ----------------------------------------------------------------------------
+# Endpoint'ler
+# ----------------------------------------------------------------------------
 @app.get("/health")
 async def get_status(request: Request):
     return {"status": "ok", "chunks": len(request.app.state.chunks)}
 
 
 @app.post("/ask", response_model=RagAnswer)
-def ask(payload: AskRequest, request: Request) -> RagAnswer:
-    # async DEĞİL: retrieve + generate blocking. FastAPI threadpool'a atar.
-    chunks = request.app.state.chunks
-    doc_vecs = request.app.state.doc_vecs
-
-    ilgili_chunklar = retrieve(payload.question, chunks, doc_vecs, k=payload.k)
-    context = build_context(ilgili_chunklar)
-
+async def ask(rtr: Retrieval = Depends(get_retrieval)) -> RagAnswer:
     try:
-        return generate(payload.question, context)
+        answer = await run_in_threadpool(generate, rtr.question, rtr.context)
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=f"LLM servisi yanıt vermedi: {e}")
 
+    # reliability'yi modelin tahminiyle değil, ölçülen skorla değiştiriyoruz.
+    answer.reliability = rtr.reliability
+    return answer
+
 
 @app.post("/ask/stream")
-async def ask_stream(payload: AskRequest, request: Request) -> StreamingResponse:
-    # async DOĞRU: stream_generate await'li bir async generator.
-    chunks = request.app.state.chunks
-    doc_vecs = request.app.state.doc_vecs
-
-    # retrieve HÂLÂ blocking -> event loop'u kilitlememek için threadpool'a at.
-    ilgili_chunklar = await run_in_threadpool(
-        retrieve, payload.question, chunks, doc_vecs, payload.k
-    )
-    context = build_context(ilgili_chunklar)
-
+async def ask_stream(rtr: Retrieval = Depends(get_retrieval)) -> StreamingResponse:
     async def event_stream() -> AsyncIterator[str]:
-        # 1) Kaynaklar: modelden beklemeye gerek yok, elimizde hazır.
-        yield sse("sources", [
-            {"id": i, "preview": c[:120]}
-            for i, c in enumerate(ilgili_chunklar)
-        ])
+        # 1) Kaynaklar + güven: modelden beklemeye gerek yok, ilk milisaniyede hazır.
+        yield sse("sources", rtr.as_sources())
+        yield sse("reliability", rtr.reliability)
 
-        # 2) Token'lar: model ürettikçe geçir.
+        # 2) Token'lar
         try:
-            async for text in stream_generate(payload.question, context):
+            async for text in stream_generate(rtr.question, rtr.context):
                 yield sse("token", text)
         except Exception as e:
-            # Stream BAŞLADIKTAN sonra HTTP status kodu değiştirilemez (header gitti).
-            # Hatayı bu yüzden bir event olarak göndeririz.
+            # Stream başladıktan sonra status kodu değiştirilemez -> hata bir event'tir.
             yield sse("error", str(e))
             return
 
-        # 3) Bitti sinyali: client "done" görmeden akışı kapatmamalı.
+        # 3) Bitiş sinyali
         yield sse("done", {})
 
     return StreamingResponse(
@@ -125,3 +178,27 @@ async def ask_stream(payload: AskRequest, request: Request) -> StreamingResponse
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/agent", response_model=AgentResponse)
+def run_agent(payload: AgentRequest, request: Request) -> AgentResponse:
+    """Agentic RAG: aramayı biz değil, model yapar.
+
+    - Fonksiyon adı 'agent' DEĞİL: import ettiğimiz agent()'ı ezerdi.
+    - async DEĞİL: agent() içinde senkron messages.create var, hem de döngüde.
+      FastAPI bu fonksiyonu threadpool'a atar.
+    - Depends(get_retrieval) YOK: agent'a hazır context değil, INDEX veriyoruz.
+      Ne zaman ve hangi sorguyla arayacağına kendi karar verecek.
+    """
+    try:
+        answer = agent(
+            payload.question,
+            request.app.state.chunks,
+            request.app.state.doc_vecs,
+        )
+    except Exception as e:
+        # Agent döngüsü tipli exception fırlatmıyor (Faz 6'da düzelteceğiz),
+        # o yüzden geniş yakalayıp upstream hatası olarak raporluyoruz.
+        raise HTTPException(status_code=502, detail=f"Agent çalışırken hata: {e}")
+
+    return AgentResponse(answer=answer)
